@@ -11,10 +11,10 @@ This does require setting up a `GITHUB_TOKEN` within CircleCI.
 Example config.yml
 ```
 checkSizeLimit:
-	steps:
-	- requires
-		- install 
-	- run:
-		name: Check Size
-		command: bin/checkSize
+  requires
+    - install 
+  steps:
+    - run:
+        name: Check Size
+        command: bin/checkSize
 ```
