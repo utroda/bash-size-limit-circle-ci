@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Globals For Easy Remap
+commentTitle="Size Limit Report"
+owner=$(echo $CIRCLE_PROJECT_USERNAME)
+repo=$(echo $CIRCLE_PROJECT_REPONAME)
+pullRequest=$(echo $CIRLCE_PULL_REQUEST)
+branch=$(echo $CIRCLE_BRANCH)
+productionBranch="master"
+
+function runSizeLimit() {
+  local targetBranch=${1}
+  local skipStep=${2:-none}
+  local currentBranch=$(git rev-parse --abbrev-ref HEAD)
+
+  #
+  # The use of /dev/null is so we can get just the
+  # output of the npx command. This means, you'll need
+  # another build step to make sure the build passes.
+  #
+  if [ $targetBranch != $currentBranch ]
+  then
+    git checkout -f $targetBranch > /dev/null
+  fi
+
+  if [ $skipStep != "install" ]
+  then
+    #Or your custom install command
+    npm install > /dev/null
+  fi
+
+  if [ $skipStep != "build" ]
+  then
+    #Or your custom build command
+    npm run build > /dev/null
+  fi
+
+  echo $(npx size-limit --json)
+}
+
+function praseResults() {
+  local base=${1}
+  local current=${2}
+  local name=$(jq ".[].name" <<< $current)
+  local baseSize=$(jq ".[].size" <<< $base)
+  local baseLoading=$(jq ".[].loading" <<< $base)
+  local currentSize=$(jq ".[].size" <<< $current)
+  local currentLoading=$(jq ".[].loading" <<< $current)
+  
+  #name, size, running, loading
+
+  echo $(jq --null-input \
+    --arg name "$name" \
+    --arg baseSize "$baseSize" \
+    --arg baseLoading "$baseLoading" \
+    --arg currentSize "$currentSize" \
+    --arg currentLoading "$currentLoading" \
+    '{"name": $name, "baseSize": $baseSize, "baseLoading": $baseLoading, "currentSize": $currentSize, "currentLoading", $currentLoading}')
+)
+}
+
+function formatChange() {
+  local base=${1:-0}
+  local current=${2:-0}
+  local value=0
+  local result=""
+
+  #pipe to awk for decimals
+  value=$(echo "$current" "$base" | awk '{print int(($1-$2)*100/$1)}')
+
+  if [ $base -eq 0 ]
+  then
+    result="+100% 🔺"
+  elif [ $value -gt 0 ]
+  then
+    result="${value}% 🔺"
+  elif [ $value -eq 0 ]
+  then
+    result="${value}%"
+  else
+    result="${value}$ 🔽"
+  fi
+
+  echo $result
+}
+
+function formatTime() {
+  local seconds=${1:-0}
+  local value=""
+  local time=""
+
+  if [ $(echo "$seconds >= 1" | bc) -eq 1 ]
+  then
+    value=$(echo "$seconds" | awk '{print int(($1*10)/10)}')
+    time="s"
+  else
+    value=$(echo "$seconds" | awk '{print int($1*1000)}')
+    time="ms"
+  fi
+
+  echo "$value $time"
+}
+
+function formatBytes() {
+  local i=${1:-0} d="" s=0 S=("Bytes" "KiB" "MiB" "GiB" "TiB" "PiB" "EiB" "YiB" "ZiB")
+
+  while ((i > 1024 && s < ${#S[@]}-1)); do
+      printf -v d ".%02d" $((i % 1024 * 100 / 1024))
+      i=$((i / 1024))
+      s=$((s + 1))
+  done
+
+  echo "$i$d ${S[$s]}"
+}
+
+function generateTable() {
+  local results=${1}
+
+  local name=$(jq -r ".name" <<< $results)
+  local baseSize=$(jq -r ".baseSize" <<< $results)
+  local baseLoading=$(jq -r ".baseLoading" <<< $results)
+  local currentSize=$(jq -r ".currentSize" <<< $results)
+  local currentLoading=$(jq -r ".currentLoading" <<< $results)
+
+  local sizeDiff=$(formatChange $baseSize $currentSize)
+  local loadingNormalized=$(formatTime $currentLoading)
+  local currentSizeNormalized=$(formatBytes $currentSize)
+
+  local tableHeading="|Path|New Package Size|Change (%)|Loading Time (3g)|"
+  local tableDivider="|---|---|---|---|"
+  local tableResults="|${name}|${currentSizeNormalized}|${sizeDiff}|${loadingNormalized}|"
+
+  echo -e "$tableHeading
+  $tableDivider
+  $tableResults"
+}
+
+function fetchExisitingComment() {
+  local prNumber=${1}
+
+  local request=$(curl -s -H "Athorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/$owner/$repo/$issues/$prNumber/comments")
+  local comments=$(echo $request | jq --arg term "$commentTitle" -r '[.[] | select(.body | contains($term)) | .id]')
+
+  if [ $(echo $comments | jq length) -eq 0 ]
+  then
+    echo 0
+  else
+    echo $(echo $ocmments | jq -r ".[0]")
+  fi
+}
+
+function makeNewComment() {
+  local comment=$1
+
+  local response=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/$owner/$repo/pulls?head=$username:$branch&state=open")
+
+  if [ $(echo $response | jq length) -eq 0]
+  then
+    echo "No PR was found to update"
+  else
+    local commentUrl=$(echo $response | jq -r ".[]._links.comments.href")
+  fi
+
+  local body=$(jq --null-input --arg comment "$comment" '{"body": $comment }')
+
+  curl --location --request POST "$commentUrl" -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/json" -d "$body"
+}
+
+function updateExistingComment() {
+  local commentId=${1}
+  local comment=${2}
+
+  local body=$(jq --null-input --arg comment "$comment" '{"body": $comment }')
+  local request$(curl -X PATCH -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/$owner/$repo/issues/comments/$commentId" -d "$body")
+
+  echo $request
+}
+
+function run() {
+  local base=$(runSizeLimit "$productBranch") #or you production branch
+  local current=$(runSizeLimit "$branch" install) #skipping install step 
+  local results=$(parseResults "$base" "$current")
+  local table=$(generateTable "$results")
+  local markdownTitle=(echo "## ${commentTitle} 📦")
+  local prNumber=$(echo "$pullRequest" | tr -dc '0-9')
+  local comment="$markdownTitle
+  $table"
+  local sizeLimitCommentId=$(fetchExisitingComment $prNumber)
+
+  if [ $sizeLimitCommentId -eq 0 ]
+  then
+    makeNewComment "$comment"
+  else
+    updateExistingComment "$sizeLimitCommentId" "$comment"
+  fi
+}
+
+run
